@@ -1,0 +1,566 @@
+#!/usr/bin/python
+import sys
+import subprocess
+import os
+import json
+import argparse
+import collections
+import operator
+import threading
+import re
+import datetime
+
+ERROR_KEYWORDS = [
+    "stacktrace",
+    "unexpect",
+    "crash",
+    "error",
+    "stop",
+    "exit",
+    "retry",
+    "timeout",
+    "fail",
+    "internal.?server.?error",
+    "bad.?gateway",
+    "restart",
+    "exception",
+]
+
+COLORS = {"blue": "\033[94m", "red": "\033[91m", "green": "\033[92m"}
+C_END = "\033[0m"
+REGX_SUB = r"\x1b\[\d+m"
+THREADS = {}
+REGX = r"(?i)({})(.*)".format("|".join(ERROR_KEYWORDS))
+FNULL = open(os.devnull, "w")
+POD_REPORT = """-----------
+NAME: {name}  
+HEALTH: {c}{health}{e}
+NODE_NAME: {c}{node_name}{e}
+NODE_STATUS: {node_status}"""
+
+
+class Utility:
+    # Static class for grouping utility functions
+
+
+    @staticmethod
+    def error(msg, sysexit=False):
+        print(Utility.format_color("error: " + msg))
+        if sysexit:
+            sys.exit(1)
+
+
+    @staticmethod
+    def format_color(strn, color="red"):
+        return "{}{}{}".format(COLORS[color], strn, C_END)
+
+
+    @staticmethod
+    def print_table(data, cols=None):
+        if not cols:
+            cols = list(data[0].keys() if data else [])
+        lst = [cols]
+        for item in data:
+            lst.append([str(item[col] or "") for col in cols])
+
+        def fn(x):
+            x = str(re.sub(REGX_SUB, "", x))
+            return len(x)
+
+        col_size = [max(map(fn, col)) for col in zip(*lst)]
+        fmt = " | ".join(["{{:<{}}}".format(i) for i in col_size])
+        lst.insert(1, ["-" * i for i in col_size])
+        for item in lst:
+            print(fmt.format(*item))
+
+    
+    @staticmethod
+    def find(needle, data, key=None, inverse=False):
+        cond = lambda x: x if key in x and needle in x[key] else None
+        if inverse:
+            cond = lambda x: x if key in x and not needle in x[key] else None
+        return list(filter(cond, data))
+
+    @staticmethod
+    def prompt_user_choice(choices, prompt="Select which item: "):
+        choices_txt = ""
+        for index, item in enumerate(choices):
+            choices_txt += "{}. {}\n".format(index + 1, item)
+        
+        user_choice = input("{}\n{}".format(choices_txt, prompt))
+        return choices[int(user_choice) - 1]
+
+
+class Base:
+    """Base class for loading configuration"""
+
+    name = ""
+    inverse = False
+    verbose = False
+    namespace = None
+    context = None
+    # save_output = None
+
+    def __init__(self, *args, **kwargs):
+        for k, v in kwargs.items():
+            if hasattr(self, k):
+                setattr(self, k, v)
+
+
+class Command(Base):
+    """Command class for executing shell commands"""
+
+    raw_cmd = None
+    cmd = None
+    dry_run = None
+
+    def parse_command(self, cmd, shell=False):
+        self.raw_cmd = cmd
+        self.cmd = list(map(lambda x: x.strip(), cmd.split(" ")))
+        if shell:
+            return self.raw_cmd
+        return self.cmd
+    
+    def run(self, cmd, func=None, shell=False, **kwargs):
+        # func is a handler for handling output in realtime
+        cmd = self.parse_command(cmd, shell=shell)
+
+        if self.verbose or self.dry_run:
+            if self.dry_run:
+                return None, 0
+            print(self.raw_cmd)
+
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=shell)
+        all_output = ""
+        while True:
+            output = process.stdout.readline()
+            all_output += output
+            if output == "" and process.poll() is not None:
+                break
+            if output and func is not None:
+                func(output.strip(), **kwargs)
+        rc = process.poll()
+        return all_output, rc
+
+
+class Kubectl(Command):
+    saved_output = ""
+
+    def __init__(self, *args, **kwargs):
+        Command.__init__(self, *args, **kwargs)
+        self.set_context()
+
+    def parse_csv(self, data):
+        rows = list(map(lambda x: x.split(), data.split("\n")))
+        cols = rows.pop(0)
+        cols = list(map(lambda x: x.lower(), cols))
+        return [{cols[index]: item for index, item in enumerate(r)} for r in rows]
+
+    def format_args(self, **kwargs):
+        return " ".join(
+            [
+                "{} {}".format(k, v) if type(v) != bool else "{}".format(k)
+                for k, v in kwargs.items()
+            ]
+        )
+
+    def kube_cmd(self, cmd, **kwargs):
+        if self.namespace != None:
+            cmd = "{} -n {}".format(cmd, self.namespace)
+        return "{} {}".format(cmd, self.format_args(**kwargs))
+
+    def get(self, resource, csv=False, **kwargs):
+        cmd = self.kube_cmd("kubectl get {}".format(resource), **kwargs)
+        data, err_code = self.run(cmd)
+        if err_code == 1:
+            return
+        if csv:
+            return self.parse_csv(data)
+        return data
+
+    def get_pods(self, pod_token, csv=True, **kwargs):
+        pods = self.get("pods", csv=csv, **kwargs)
+        if csv:
+            return Utility.find(pod_token, pods, key="name", inverse=self.inverse)
+        return pods
+
+    def logs(self, pod, func=None, **kwargs):
+        cmd = self.kube_cmd("kubectl logs {}".format(pod), **kwargs)
+        return self.run(cmd, func=func, owner=pod)
+    
+    def get_contexts(self):
+        cmd = self.kube_cmd("kubectl config get-contexts -oname")
+        d, _ = self.run(cmd, shell=True)
+        return d.splitlines()
+
+    def switch_context(self, ctx):
+        cmd = self.kube_cmd("kubectl config use-context {}".format(ctx))
+        return self.run(cmd, shell=True)
+    
+    def get_ctx(self):
+        ctxs = self.get_contexts()
+        filtered = list(filter(lambda x: self.context in x, ctxs))
+
+        if len(filtered) > 1:
+            return Utility.prompt_user_choice(filtered)
+        elif len(filtered) < 1:
+            Utility.error("Context: {} not found".format("name"), sysexit=True)
+            return
+        
+        return filtered[0]
+
+    def set_context(self):
+        if self.context is None:
+            return
+        ctx = self.get_ctx()
+        if ctx is None:
+            return
+        return self.switch_context(ctx)
+
+class Auditor(Base):
+    ## TODO
+    ## Check readines and live probe
+    ## Check events for errors
+
+    print_pods = False
+    pinged_nodes = {}
+    max_age = 10
+
+    def __init__(self, *args, **kwargs):
+        Base.__init__(self, *args, **kwargs)
+        self.max_pod_age = datetime.timedelta(minutes=int(self.max_age))
+        self.kctl = Kubectl(*args, **kwargs)
+
+    def parse_custom(self, data, keys):
+        rows = data.splitlines()
+        return [{keys[k]: v for k, v in enumerate(r.split(","))} for r in rows]
+
+    def hi_node(self, node_val):
+        if type(node_val) == bool and node_val:
+            return Utility.format_color("Up", color="green")
+        return Utility.format_color("Down", color="red")
+
+    def hi_health(self, txt):
+        if "Good" in txt:
+            return Utility.format_color(txt, color="green")
+        return Utility.format_color(txt, color="red")
+
+    def hi_age(self, delta_age):
+        strn = str(delta_age.days) + "d"
+        if delta_age > self.max_pod_age:
+            return Utility.format_color(strn, color="green")
+        else:
+            return Utility.format_color(strn, color="red")
+
+    def hi_msg(self, txt):
+        if txt != "":
+            return Utility.format_color(txt, color="red")
+        return txt
+
+    def hi_restarts(self, txt):
+        n = int(txt)
+        if n > 2:
+            return Utility.format_color(n, "red")
+        return Utility.format_color(n, "green")
+
+    def hi_status(self, txt):
+        if "running" in txt.lower():
+            return Utility.format_color(txt, "green")
+        return Utility.format_color(txt, "red")
+
+    def hi_perc(self, perc):
+        if int(perc) > 70:
+            return Utility.format_color(perc, "green")
+        return Utility.format_color(perc, "red")
+
+    def audit_pod(self, pod):
+        pod["timestamp"] = datetime.datetime.strptime(
+            pod["timestamp"], "%Y-%m-%dT%H:%M:%SZ"
+        )
+        pod["restarts"] = sum(
+            list(map(lambda x: int(x) if x else 0, pod["restarts"].split("+")))
+        )
+        pod["age"] = datetime.datetime.now() - pod["timestamp"]
+        pod["node_status"] = self.hi_node(self.check_host(pod["node"]))
+        pod["terminated_msg"] = self.hi_msg(
+            re.sub(r"<no value>", "", pod["terminated_msg"])
+        )
+
+        if (
+            (pod["restarts"] > 1 and pod["age"] > self.max_pod_age)
+            or not pod["node_status"]
+            or pod["status"].lower() != "running"
+        ):
+            pod["health"] = self.hi_health("Bad")
+        else:
+            pod["health"] = self.hi_health("Good")
+
+        pod["age"] = self.hi_age(pod["age"])
+        pod["status"] = self.hi_status(pod["status"])
+        pod["restarts"] = self.hi_restarts(pod["restarts"])
+        # pod.pop("node")
+        pod.pop("timestamp")
+
+        return pod
+
+    def audit_pods(self, pods):
+        audited_pods = list(map(self.audit_pod, pods))
+        ready_pods = [p for p in audited_pods if "running" in p["status"].lower()]
+
+        return {
+            "ready_percentage": (len(ready_pods) / len(audited_pods)) * 100,
+            "total_pods": len(audited_pods),
+            "total_nodes": len(self.pinged_nodes.keys()),
+            "ready_nodes": len([n for n in self.pinged_nodes.values() if n]),
+            "audited_pods": audited_pods,
+        }
+
+    def get_pods(self):
+        go_template = """
+        {{range.items}}
+            {{.metadata.name}},
+            {{.status.phase}},
+            {{.spec.nodeName}},
+            {{range .status.containerStatuses}}{{.restartCount}}+{{end}},
+            {{range .status.containerStatuses}}{{.lastState.terminated.message}}{{end}},
+            {{.metadata.creationTimestamp}}{{"\\n"}}
+        {{end}}
+        """
+        formatted = re.sub(r"\s", "", go_template)
+        pods = self.kctl.get_pods(
+            self.name, csv=False, **{"-o": "go-template", "--template": formatted}
+        )
+
+        cstm = self.parse_custom(
+            pods, ["name", "status", "node", "restarts", "terminated_msg", "timestamp"]
+        )
+
+        return Utility.find(self.name, cstm, key="name", inverse=self.inverse)
+
+    def print_audited_pods(self, pods):
+        Utility.print_table(pods)
+
+    def main(self):
+
+        pods = self.get_pods()
+        if len(pods) < 1:
+            Utility.error("Pods not found", sysexit=True)
+        audited = self.audit_pods(pods)
+        audited["ready_percentage"] = self.hi_perc(audited["ready_percentage"])
+        self.print_audited_pods(audited.pop("audited_pods"))
+
+    def check_host(self, host):
+        if host in self.pinged_nodes:
+            return self.pinged_nodes[host]
+        self.pinged_nodes[host] = (
+            subprocess.call(
+                "ping -c 1 {}".format(host).split(" "),
+                stdout=FNULL,
+                stderr=subprocess.STDOUT,
+            )
+            == 0
+        )
+        return self.pinged_nodes[host]
+
+
+class Logger(Base):
+
+    lines = 100
+    follow = False
+    highlight = False
+    regx = r"(?i)({})(.*)".format("|".join(ERROR_KEYWORDS))
+    custom_regx = ""
+
+    def __init__(self, *args, **kwargs):
+        Base.__init__(self, *args, **kwargs)
+        self.kctl = Kubectl(*args, **kwargs)
+
+    def get_kctl_kwargs(self):
+
+        kwargs = {}
+        if self.lines > 0:
+            kwargs["--tail"] = self.lines
+        if self.follow:
+            kwargs["--follow"] = self.follow
+
+        return kwargs
+
+    def check_errors(self, log):
+        parse_rgx = lambda x: Utility.format_color(str(x.group(0)))
+        regx = self.regx
+
+        if self.custom_regx:
+            regx = self.custom_regx
+        if self.highlight:
+            return re.sub(regx, parse_rgx, log)
+
+        return log
+
+    def print_log(self, log, owner="", **kwargs):
+        owner = Utility.format_color(owner, "blue")
+        print("{}:{}".format(owner, self.check_errors(log)))
+
+    # def save_log(self, log, owner=""):
+    #     if not self.save_output:
+    #         return
+    #     with open(owner, "w") as f:
+    #         f.write(json.dumps(log))
+
+    def handle_log(self, log, owner="", **kwargs):
+        self.print_log(log, owner=owner, **kwargs)
+        # self.save_log(log, owner=owner, **kwargs)
+
+    def run_from_thread(self, pod, kwargs):
+        t = threading.Thread(target=self.kctl.logs, args=(pod,), kwargs=kwargs)
+        t.name = pod
+        THREADS[pod] = {"thread": t}
+        t.start()
+
+    def run_normal(self, pod, kwargs):
+        self.kctl.logs(pod, **kwargs)
+        pass
+
+    def main(self):
+        pods = self.kctl.get_pods(self.name, **{"-o": "wide"})
+        if len(pods) < 1:
+            Utility.error("Pods not found", sysexit=True)
+        for p in pods:
+            if not "name" in p:
+                continue
+            log_kwargs = self.get_kctl_kwargs()
+            log_kwargs["func"] = self.handle_log
+            if self.follow:
+                self.run_from_thread(p["name"], log_kwargs)
+                continue
+
+            self.run_normal(p["name"], log_kwargs)
+
+
+class Parser:
+    def __init__(self):
+        self.parser = argparse.ArgumentParser(
+            description="Utility tool for observing kubernetes resources"
+        )
+        self.command_parser = self.parser.add_subparsers(
+            dest="command", help="Commands"
+        )
+        self.install_audit_parser(self.command_parser)
+        self.install_logs_parser(self.command_parser)
+
+    def install_common(self, parser):
+        parser.add_argument("name", help="Resource name")
+        parser.add_argument("-n", "--namespace", help="Namespace", metavar="<arg>")
+        parser.add_argument(
+            "-i",
+            "--inverse",
+            help="Does not container 'name'",
+            default=Base.inverse,
+            action="store_true",
+        )
+        parser.add_argument(
+            "-v",
+            "--verbose",
+            help="Prints commands used",
+            default=Base.verbose,
+            action="store_true",
+        )
+
+        parser.add_argument(
+            "-ctx",
+            "--context",
+            help="Specify which context to use based on kube-config",
+            default=Base.context,
+            metavar="<name>"
+        )
+
+        # TODO incomplete feature
+        # parser.add_argument(
+        #     "-s",
+        #     "--save-output",
+        #     help="Saves output in a directory",
+        #     default=Base.save_output,
+        #     action="store_true",
+        # )
+
+    def install_audit_parser(self, parser):
+        audit_parser = parser.add_parser(
+            "audit", help="Audits the state of the resource specified"
+        )
+        self.install_common(audit_parser)
+
+        # TODO incomplete feature
+        # audit_parser.add_argument(
+        #     "-pp",
+        #     "--print-pods",
+        #     help="Prints pods status summary",
+        #     default=Auditor.print_pods,
+        #     action="store_true",
+        # )
+
+        audit_parser.add_argument(
+            "-ma",
+            "--max-age",
+            help="Will highlight pods that surpass the limit",
+            default=Auditor.max_age,
+            metavar="<minutes>"
+        )
+
+    def install_logs_parser(self, parser):
+        logs_parser = parser.add_parser(
+            "logs", help="Prints logs from multiple resources concurrently"
+        )
+        self.install_common(logs_parser)
+
+        logs_parser.add_argument(
+            "-l",
+            "--lines",
+            help="No of lines to take from each log. Defaults to 1000",
+            default=Logger.lines,
+            metavar="<number>"
+        )
+
+        logs_parser.add_argument(
+            "-f",
+            "--follow",
+            help="Follows logs",
+            default=Logger.follow,
+            action="store_true",
+        )
+
+        logs_parser.add_argument(
+            "-hi",
+            "--highlight",
+            help="Will highlight errors and warnings",
+            default=Logger.highlight,
+            action="store_true",
+        )
+
+
+        #INCOMPLETE FEATURE TODO
+        # logs_parser.add_argument(
+        #     "-ct",
+        #     "--container",
+        #     help="Grab logs from a specific container",
+        # )
+
+        logs_parser.add_argument(
+            "-regx",
+            "--custom-regx",
+            help="Will highlight output based on the regx provided",
+            default=Logger.custom_regx,
+            metavar="<^some_word$>",
+        )
+
+    def parse(self):
+        return vars(self.parser.parse_args())
+
+
+if __name__ == "__main__":
+    args = Parser().parse()
+
+    COMMANDS = {"audit": Auditor, "logs": Logger}
+
+    try:
+        COMMANDS[args["command"]](**args).main()
+    except KeyboardInterrupt:
+        print("\nBye bye")
