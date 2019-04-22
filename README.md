@@ -1,4 +1,4 @@
-# KubeLogs
+# Klogs
 
 ## Description
 
