@@ -23,6 +23,7 @@ ERROR_KEYWORDS = [
     "bad.?gateway",
     "restart",
     "exception",
+    '"level": "ERROR".*'
 ]
 
 COLORS = {"blue": "\033[94m", "red": "\033[91m", "green": "\033[92m"}
@@ -299,10 +300,6 @@ class Auditor(Base):
         pod["age"] = self.hi_age(pod["age"])
         pod["status"] = self.hi_status(pod["status"])
         pod["restarts"] = self.hi_restarts(pod["restarts"])
-        pod.pop("restarts")
-        # pod.pop("status")
-        pod.pop("age")
-        # pod.pop("node")
         pod.pop("timestamp")
 
         return pod
