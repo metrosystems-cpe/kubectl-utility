@@ -4,11 +4,10 @@ import subprocess
 import os
 import json
 import argparse
-import collections
-import operator
 import threading
 import re
 import datetime
+
 
 ERROR_KEYWORDS = [
     "stacktrace",
@@ -32,16 +31,10 @@ REGX_SUB = r"\x1b\[\d+m"
 THREADS = {}
 REGX = r"(?i)({})(.*)".format("|".join(ERROR_KEYWORDS))
 FNULL = open(os.devnull, "w")
-POD_REPORT = """-----------
-NAME: {name}  
-HEALTH: {c}{health}{e}
-NODE_NAME: {c}{node_name}{e}
-NODE_STATUS: {node_status}"""
 
 
 class Utility:
     # Static class for grouping utility functions
-
 
     @staticmethod
     def error(msg, sysexit=False):
@@ -63,15 +56,27 @@ class Utility:
         for item in data:
             lst.append([str(item[col] or "") for col in cols])
 
-        def fn(x):
-            x = str(re.sub(REGX_SUB, "", x))
-            return len(x)
-
+        fn = lambda x:len(str(re.sub(REGX_SUB, "", x)))
         col_size = [max(map(fn, col)) for col in zip(*lst)]
         fmt = " | ".join(["{{:<{}}}".format(i) for i in col_size])
         lst.insert(1, ["-" * i for i in col_size])
-        for item in lst:
-            print(fmt.format(*item))
+        replace_regx = r"" 
+
+        def add_spaces(x, idx):
+            fx = lambda x: str(re.sub(REGX_SUB, "", x))
+            to_add = col_size[idx] - len(fx(x))
+            if to_add <= 0:
+                return x
+
+            return x + (" " * to_add)
+
+        for index, item in enumerate(lst):
+            
+            # .format has trouble adding spaces to colored strings
+            # thus manually adding spaces
+            fmtted = [add_spaces(x, idx) for idx, x in enumerate(item)]
+            print(' | '.join(fmtted))
+            #print(fmt.format(*item))
 
     
     @staticmethod
@@ -218,10 +223,6 @@ class Kubectl(Command):
         return self.switch_context(ctx)
 
 class Auditor(Base):
-    ## TODO
-    ## Check readines and live probe
-    ## Check events for errors
-
     print_pods = False
     pinged_nodes = {}
     max_age = 10
@@ -298,6 +299,9 @@ class Auditor(Base):
         pod["age"] = self.hi_age(pod["age"])
         pod["status"] = self.hi_status(pod["status"])
         pod["restarts"] = self.hi_restarts(pod["restarts"])
+        pod.pop("restarts")
+        # pod.pop("status")
+        pod.pop("age")
         # pod.pop("node")
         pod.pop("timestamp")
 
