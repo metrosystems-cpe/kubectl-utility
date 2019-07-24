@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/local/bin/python3
 import sys
 import subprocess
 import os
@@ -7,6 +7,7 @@ import argparse
 import threading
 import re
 import datetime
+import fcntl
 
 
 ERROR_KEYWORDS = [
@@ -23,7 +24,7 @@ ERROR_KEYWORDS = [
     "bad.?gateway",
     "restart",
     "exception",
-    '"level": "ERROR".*'
+    '"level": "ERROR".*',
 ]
 
 COLORS = {"blue": "\033[94m", "red": "\033[91m", "green": "\033[92m"}
@@ -43,11 +44,9 @@ class Utility:
         if sysexit:
             sys.exit(1)
 
-
     @staticmethod
     def format_color(strn, color="red"):
         return "{}{}{}".format(COLORS[color], strn, C_END)
-
 
     @staticmethod
     def print_table(data, cols=None):
@@ -57,11 +56,11 @@ class Utility:
         for item in data:
             lst.append([str(item[col] or "") for col in cols])
 
-        fn = lambda x:len(str(re.sub(REGX_SUB, "", x)))
+        fn = lambda x: len(str(re.sub(REGX_SUB, "", x)))
         col_size = [max(map(fn, col)) for col in zip(*lst)]
         fmt = " | ".join(["{{:<{}}}".format(i) for i in col_size])
         lst.insert(1, ["-" * i for i in col_size])
-        replace_regx = r"" 
+        replace_regx = r""
 
         def add_spaces(x, idx):
             fx = lambda x: str(re.sub(REGX_SUB, "", x))
@@ -72,14 +71,13 @@ class Utility:
             return x + (" " * to_add)
 
         for index, item in enumerate(lst):
-            
+
             # .format has trouble adding spaces to colored strings
             # thus manually adding spaces
             fmtted = [add_spaces(x, idx) for idx, x in enumerate(item)]
-            print(' | '.join(fmtted))
-            #print(fmt.format(*item))
+            print(" | ".join(fmtted))
+            # print(fmt.format(*item))
 
-    
     @staticmethod
     def find(needle, data, key=None, inverse=False):
         cond = lambda x: x if key in x and needle in x[key] else None
@@ -92,7 +90,7 @@ class Utility:
         choices_txt = ""
         for index, item in enumerate(choices):
             choices_txt += "{}. {}\n".format(index + 1, item)
-        
+
         user_choice = input("{}\n{}".format(choices_txt, prompt))
         return choices[int(user_choice) - 1]
 
@@ -120,15 +118,30 @@ class Command(Base):
     cmd = None
     dry_run = None
 
-    def parse_command(self, cmd, shell=False):
+    def parse_output(o):
+        pass
+
+    def parse_command(self, cmd, shell=True):
         self.raw_cmd = cmd
         self.cmd = list(map(lambda x: x.strip(), cmd.split(" ")))
         if shell:
             return self.raw_cmd
         return self.cmd
-    
-    def run(self, cmd, func=None, shell=False, **kwargs):
-        # func is a handler for handling output in realtime
+
+    def read(self, output):
+        fd = output.fileno()
+        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+        try:
+            return output.read()
+        except:
+            return ""
+
+    def run(self, cmd, shell=True, **kwargs):
+        p = subprocess.check_output(cmd, shell=shell)
+        return p.decode("utf-8")
+
+    def run_realtime(self, cmd, func=None, shell=True, **kwargs):
         cmd = self.parse_command(cmd, shell=shell)
 
         if self.verbose or self.dry_run:
@@ -136,17 +149,19 @@ class Command(Base):
                 return None, 0
             print(self.raw_cmd)
 
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=shell)
-        all_output = ""
+        process = subprocess.Popen(
+            cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+        )
+        stdout = []
         while True:
-            output = process.stdout.readline()
-            all_output += output
-            if output == "" and process.poll() is not None:
+            line = process.stdout.readline().decode("utf-8")
+            stdout.append(line)
+            if line == "" and rc is not None:
                 break
-            if output and func is not None:
-                func(output.strip(), **kwargs)
-        rc = process.poll()
-        return all_output, rc
+            if line and func is not None:
+                func(line.strip(), **kwargs)
+            rc = process.poll()
+        return "\n".join(stdout), rc
 
 
 class Kubectl(Command):
@@ -177,9 +192,7 @@ class Kubectl(Command):
 
     def get(self, resource, csv=False, **kwargs):
         cmd = self.kube_cmd("kubectl get {}".format(resource), **kwargs)
-        data, err_code = self.run(cmd)
-        if err_code == 1:
-            return
+        data = self.run(cmd)
         if csv:
             return self.parse_csv(data)
         return data
@@ -192,8 +205,8 @@ class Kubectl(Command):
 
     def logs(self, pod, func=None, **kwargs):
         cmd = self.kube_cmd("kubectl logs {}".format(pod), **kwargs)
-        return self.run(cmd, func=func, owner=pod)
-    
+        return self.run_realtime(cmd, func=func, owner=pod)
+
     def get_contexts(self):
         cmd = self.kube_cmd("kubectl config get-contexts -oname")
         d, _ = self.run(cmd, shell=True)
@@ -202,7 +215,7 @@ class Kubectl(Command):
     def switch_context(self, ctx):
         cmd = self.kube_cmd("kubectl config use-context {}".format(ctx))
         return self.run(cmd, shell=True)
-    
+
     def get_ctx(self):
         ctxs = self.get_contexts()
         filtered = list(filter(lambda x: self.context in x, ctxs))
@@ -212,7 +225,7 @@ class Kubectl(Command):
         elif len(filtered) < 1:
             Utility.error("Context: {} not found".format("name"), sysexit=True)
             return
-        
+
         return filtered[0]
 
     def set_context(self):
@@ -222,6 +235,7 @@ class Kubectl(Command):
         if ctx is None:
             return
         return self.switch_context(ctx)
+
 
 class Auditor(Base):
     print_pods = False
@@ -316,6 +330,10 @@ class Auditor(Base):
             "audited_pods": audited_pods,
         }
 
+    # def get_nodes(self):
+    #     nodes = self.kctl.get("nodes", csv=True)
+    #     return nodes
+
     def get_pods(self):
         go_template = """
         {{range.items}}
@@ -343,11 +361,15 @@ class Auditor(Base):
 
     def main(self):
 
+        # self.nodes = self.get_nodes()
+        # print(self.nodes)
         pods = self.get_pods()
         if len(pods) < 1:
             Utility.error("Pods not found", sysexit=True)
+        print("auditing")
         audited = self.audit_pods(pods)
         audited["ready_percentage"] = self.hi_perc(audited["ready_percentage"])
+        print("printing")
         self.print_audited_pods(audited.pop("audited_pods"))
 
     def check_host(self, host):
@@ -379,7 +401,7 @@ class Logger(Base):
     def get_kctl_kwargs(self):
 
         kwargs = {}
-        if self.lines > 0:
+        if int(self.lines) > 0:
             kwargs["--tail"] = self.lines
         if self.follow:
             kwargs["--follow"] = self.follow
@@ -412,14 +434,14 @@ class Logger(Base):
         # self.save_log(log, owner=owner, **kwargs)
 
     def run_from_thread(self, pod, kwargs):
-        t = threading.Thread(target=self.kctl.logs, args=(pod,), kwargs=kwargs)
-        t.name = pod
-        THREADS[pod] = {"thread": t}
-        t.start()
+        self.kctl.logs(pod, **kwargs)
+        # t = threading.Thread(target=self.kctl.logs, args=(pod,), kwargs=kwargs)
+        # t.name = pod
+        # THREADS[pod] = {"thread": t}
+        # t.start()
 
     def run_normal(self, pod, kwargs):
-        self.kctl.logs(pod, **kwargs)
-        pass
+        return self.kctl.logs(pod, **kwargs)
 
     def main(self):
         pods = self.kctl.get_pods(self.name, **{"-o": "wide"})
@@ -434,7 +456,7 @@ class Logger(Base):
                 self.run_from_thread(p["name"], log_kwargs)
                 continue
 
-            self.run_normal(p["name"], log_kwargs)
+            print(self.run_normal(p["name"], log_kwargs))
 
 
 class Parser:
@@ -471,7 +493,7 @@ class Parser:
             "--context",
             help="Specify which context to use based on kube-config",
             default=Base.context,
-            metavar="<name>"
+            metavar="<name>",
         )
 
         # TODO incomplete feature
@@ -503,7 +525,7 @@ class Parser:
             "--max-age",
             help="Will highlight pods that surpass the limit",
             default=Auditor.max_age,
-            metavar="<minutes>"
+            metavar="<minutes>",
         )
 
     def install_logs_parser(self, parser):
@@ -517,7 +539,7 @@ class Parser:
             "--lines",
             help="No of lines to take from each log. Defaults to 1000",
             default=Logger.lines,
-            metavar="<number>"
+            metavar="<number>",
         )
 
         logs_parser.add_argument(
@@ -536,8 +558,7 @@ class Parser:
             action="store_true",
         )
 
-
-        #INCOMPLETE FEATURE TODO
+        # INCOMPLETE FEATURE TODO
         # logs_parser.add_argument(
         #     "-ct",
         #     "--container",
@@ -557,8 +578,11 @@ class Parser:
 
 
 if __name__ == "__main__":
-    args = Parser().parse()
+    parser = Parser()
+    args = parser.parse()
 
+    if args["command"] == None:
+        parser.parser.error("invalid command")
     COMMANDS = {"audit": Auditor, "logs": Logger}
 
     try:
