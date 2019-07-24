@@ -209,7 +209,7 @@ class Kubectl(Command):
 
     def get_contexts(self):
         cmd = self.kube_cmd("kubectl config get-contexts -oname")
-        d, _ = self.run(cmd, shell=True)
+        d = self.run(cmd, shell=True)
         return d.splitlines()
 
     def switch_context(self, ctx):
@@ -347,7 +347,7 @@ class Auditor(Base):
         """
         formatted = re.sub(r"\s", "", go_template)
         pods = self.kctl.get_pods(
-            self.name, csv=False, **{"-o": "go-template", "--template": formatted}
+            self.name, csv=False, **{"-o": "go-template", "--template": "'"+formatted+"'"}
         )
 
         cstm = self.parse_custom(
@@ -366,10 +366,8 @@ class Auditor(Base):
         pods = self.get_pods()
         if len(pods) < 1:
             Utility.error("Pods not found", sysexit=True)
-        print("auditing")
         audited = self.audit_pods(pods)
         audited["ready_percentage"] = self.hi_perc(audited["ready_percentage"])
-        print("printing")
         self.print_audited_pods(audited.pop("audited_pods"))
 
     def check_host(self, host):
@@ -434,11 +432,11 @@ class Logger(Base):
         # self.save_log(log, owner=owner, **kwargs)
 
     def run_from_thread(self, pod, kwargs):
-        self.kctl.logs(pod, **kwargs)
-        # t = threading.Thread(target=self.kctl.logs, args=(pod,), kwargs=kwargs)
-        # t.name = pod
-        # THREADS[pod] = {"thread": t}
-        # t.start()
+        # self.kctl.logs(pod, **kwargs)
+        t = threading.Thread(target=self.kctl.logs, args=(pod,), kwargs=kwargs)
+        t.name = pod
+        THREADS[pod] = {"thread": t}
+        t.start()
 
     def run_normal(self, pod, kwargs):
         return self.kctl.logs(pod, **kwargs)
