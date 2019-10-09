@@ -103,7 +103,7 @@ class Base:
     verbose = False
     namespace = None
     context = None
-    # save_output = None
+    save_output = None
 
     def __init__(self, *args, **kwargs):
         for k, v in kwargs.items():
@@ -391,6 +391,7 @@ class Logger(Base):
     highlight = False
     regx = r"(?i)({})(.*)".format("|".join(ERROR_KEYWORDS))
     custom_regx = ""
+    logs = {}
 
     def __init__(self, *args, **kwargs):
         Base.__init__(self, *args, **kwargs)
@@ -421,15 +422,22 @@ class Logger(Base):
         owner = Utility.format_color(owner, "blue")
         print("{}:{}".format(owner, self.check_errors(log)))
 
-    # def save_log(self, log, owner=""):
-    #     if not self.save_output:
-    #         return
-    #     with open(owner, "w") as f:
-    #         f.write(json.dumps(log))
+    def save_log(self, log, owner=""):
+        if not self.save_output:
+            return
+        if owner in self.logs:
+            self.logs[owner] += self.logs[owner] + log
+        else:
+            self.logs[owner] = log
+
+        fname = owner + "-date-" + datetime.datetime.now().strftime("%m-%d-%Y") + ".log"
+        
+        with open(fname, "w") as f:
+            f.write(self.logs[owner])
 
     def handle_log(self, log, owner="", **kwargs):
         self.print_log(log, owner=owner, **kwargs)
-        # self.save_log(log, owner=owner, **kwargs)
+        self.save_log(log, owner=owner, **kwargs)
 
     def run_from_thread(self, pod, kwargs):
         # self.kctl.logs(pod, **kwargs)
@@ -494,14 +502,14 @@ class Parser:
             metavar="<name>",
         )
 
-        # TODO incomplete feature
-        # parser.add_argument(
-        #     "-s",
-        #     "--save-output",
-        #     help="Saves output in a directory",
-        #     default=Base.save_output,
-        #     action="store_true",
-        # )
+        #TODO incomplete feature
+        parser.add_argument(
+            "-s",
+            "--save-output",
+            help="Saves output in a directory",
+            default=Base.save_output,
+            action="store_true",
+        )
 
     def install_audit_parser(self, parser):
         audit_parser = parser.add_parser(
@@ -573,6 +581,7 @@ class Parser:
 
     def parse(self):
         return vars(self.parser.parse_args())
+
 
 
 if __name__ == "__main__":
